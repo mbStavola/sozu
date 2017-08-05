@@ -17,7 +17,7 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,
   remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate};
 
 fn main() {
@@ -39,6 +39,8 @@ fn main() {
                                     .about("upgrades the proxy"))
                         .subcommand(SubCommand::with_name("status")
                                     .about("gets information on the running workers"))
+                        .subcommand(SubCommand::with_name("metrics")
+                                    .about("gets statistics on the master and its workers"))
                         .subcommand(SubCommand::with_name("state")
                                     .about("state management")
                                     .subcommand(SubCommand::with_name("save")
@@ -114,12 +116,12 @@ fn main() {
                                                       .long("path_begin")
                                                       .value_name("URL prefix of the frontend")
                                                       .takes_value(true)
-                                                      .required(false)))
+                                                      .required(false))
                                                   .arg(Arg::with_name("certificate")
                                                       .long("certificate")
                                                       .value_name("path to a certificate file")
                                                       .takes_value(true)
-                                                      .required(false))
+                                                      .required(false)))
                                                 .subcommand(SubCommand::with_name("remove")
                                                   .arg(Arg::with_name("id")
                                                       .short("i")
@@ -137,12 +139,12 @@ fn main() {
                                                       .long("path_begin")
                                                       .value_name("URL prefix of the frontend")
                                                       .takes_value(true)
-                                                      .required(false)))
+                                                      .required(false))
                                                   .arg(Arg::with_name("certificate")
                                                       .long("certificate")
                                                       .value_name("path to a certificate file")
                                                       .takes_value(true)
-                                                      .required(false)))
+                                                      .required(false))))
                         .subcommand(SubCommand::with_name("certificate")
                                                 .about("certificate management")
                                                 .subcommand(SubCommand::with_name("add")
@@ -191,6 +193,9 @@ fn main() {
     },
     ("status", Some(_)) => {
       status(&mut channel);
+    },
+    ("metrics", Some(_)) => {
+      metrics(&mut channel);
     },
     ("state", Some(sub))    => {
       match sub.subcommand() {

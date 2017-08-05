@@ -7,7 +7,7 @@ use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use mio::timer::{Timer,Timeout};
-use std::collections::{HashSet,HashMap};
+use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
@@ -23,8 +23,9 @@ use rand::random;
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
+use network::metrics::METRICS;
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
-use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage,Topic};
+use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
@@ -47,6 +48,7 @@ pub struct Server {
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   channel:         ProxyChannel,
+  queue:           VecDeque<OrderMessageAnswer>,
   http:            Option<Session<http::ServerConfiguration, http::Client>>,
   https:           Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
@@ -54,15 +56,24 @@ pub struct Server {
 
 impl Server {
   pub fn new(poll: Poll, channel: ProxyChannel,
-    http: Option<Session<http::ServerConfiguration, http::Client>>,
+    http:  Option<Session<http::ServerConfiguration, http::Client>>,
     https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
-    tcp: Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
+    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
+
     poll.register(
       &channel,
       Token(0),
       Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
       PollOpt::edge()
     ).expect("should register the channel");
+
+    METRICS.with(|metrics| {
+      if let Some(sock) = (*metrics.borrow()).socket() {
+        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+      } else {
+        error!("could not register metrics socket");
+      }
+    });
 
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     let timer   = Timer::default();
@@ -75,6 +86,7 @@ impl Server {
       accept_ready:    HashSet::new(),
       can_accept:      true,
       channel:         channel,
+      queue:           VecDeque::new(),
       http:            http,
       https:           https,
       tcp:             tcp,
@@ -104,42 +116,82 @@ impl Server {
             continue;
           }
           self.channel.handle_events(kind);
-          self.channel.run();
 
           // loop here because iterations has borrow issues
           loop {
-            let msg = self.channel.read_message();
-            //info!("got message: {:?}", msg);
+            if !self.queue.is_empty() {
+              self.channel.interest.insert(Ready::writable());
+            }
 
-            // if the message was too large, we grow the buffer and retry to read if possible
-            if msg.is_none() {
-              if (self.channel.interest & self.channel.readiness).is_readable() {
-                self.channel.run();
-                continue;
-              } else {
-                break;
+            //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
+            //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
+            if self.channel.readiness() == Ready::empty() {
+              break;
+            }
+
+            if self.channel.readiness().is_readable() {
+              self.channel.readable();
+
+              loop {
+                let msg = self.channel.read_message();
+
+                // if the message was too large, we grow the buffer and retry to read if possible
+                if msg.is_none() {
+                  if (self.channel.interest & self.channel.readiness).is_readable() {
+                    self.channel.readable();
+                    continue;
+                  } else {
+                    break;
+                  }
+                }
+
+                let msg = msg.expect("the message should be valid");
+                if let Order::HardStop = msg.order {
+                  self.notify(msg);
+                  //FIXME: it's a bit brutal
+                  return;
+                } else if let Order::SoftStop = msg.order {
+                  self.shutting_down = Some(msg.id.clone());
+                  self.notify(msg);
+                } else {
+                  self.notify(msg);
+                }
+
               }
             }
 
-            let msg = msg.expect("the message should be valid");
-            if let Order::HardStop = msg.order {
-              self.notify(msg);
-              self.channel.run();
-              //FIXME: it's a bit brutal
-              return;
-            } else if let Order::SoftStop = msg.order {
-              self.shutting_down = Some(msg.id.clone());
-              self.notify(msg);
-            } else {
-              self.notify(msg);
+            if !self.queue.is_empty() {
+              self.channel.interest.insert(Ready::writable());
+            }
+            if self.channel.readiness.is_writable() {
+
+              loop {
+
+                if let Some(msg) = self.queue.pop_front() {
+                  if !self.channel.write_message(&msg) {
+                    self.queue.push_front(msg);
+                  }
+                }
+
+                if self.channel.back_buf.available_data() > 0 {
+                  self.channel.writable();
+                }
+
+                if !self.channel.readiness.is_writable() {
+                  break;
+                }
+
+                if self.channel.back_buf.available_data() == 0 && self.queue.len() == 0 {
+                  break;
+                }
+              }
             }
           }
 
-          self.channel.run();
         } else if event.token() == Token(1) {
-          while let Some(token) = self.timer.poll() {
-            self.timeout(token);
-          }
+          METRICS.with(|metrics| {
+            (*metrics.borrow_mut()).writable();
+          });
         } else {
           //self.ready(event.token(), event.readiness());
           match proxy_type(event.token().0) {
@@ -172,6 +224,10 @@ impl Server {
         self.tcp = Some(tcp);
       }
 
+      METRICS.with(|metrics| {
+        (*metrics.borrow_mut()).send_data();
+      });
+
       //FIXME: manually call the timer instead of relying on a separate thread
       while let Some(token) = self.timer.poll() {
         self.timeout(token);
@@ -187,23 +243,38 @@ impl Server {
   }
 
   fn notify(&mut self, message: OrderMessage) {
+    if let Order::Metrics = message.order {
+      let q = &mut self.queue;
+      //let id = message.id.clone();
+      let msg = METRICS.with(|metrics| {
+        q.push_back(OrderMessageAnswer {
+          id:     message.id.clone(),
+          status: OrderMessageStatus::Ok,
+          data:   Some(OrderMessageAnswerData::Metrics(
+            (*metrics.borrow()).dump_data()
+          ))
+        });
+      });
+      return;
+    }
+
     let topics = message.order.get_topics();
 
     if topics.contains(&Topic::HttpProxyConfig) {
       if let Some(mut http) = self.http.take() {
-        http.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.queue.push_back(http.configuration().notify(&mut self.poll, message.clone()));
         self.http = Some(http);
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
       if let Some(mut https) = self.https.take() {
-        https.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.queue.push_back(https.configuration().notify(&mut self.poll, message.clone()));
         self.https = Some(https);
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
       if let Some(mut tcp) = self.tcp.take() {
-        tcp.configuration().notify(&mut self.poll, &mut self.channel, message);
+        self.queue.push_back(tcp.configuration().notify(&mut self.poll, message));
         self.tcp = Some(tcp);
       }
     }

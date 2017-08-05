@@ -96,10 +96,8 @@ fn main() {
     logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
     info!("starting up");
 
-    let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
-    METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
-    let metrics_guard  = ProxyMetrics::run();
+    metrics_set_up!(&config.metrics.address[..], config.metrics.port);
+    gauge!("sozu.TEST", 42);
 
     if check_process_limits(config.clone()) {
       match start_workers(&config) {

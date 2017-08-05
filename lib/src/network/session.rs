@@ -151,7 +151,7 @@ pub enum AcceptError {
 
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage);
+  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn front_timeout(&self) -> u64;
@@ -225,6 +225,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     self.close_backend(token);
     self.clients[token].close();
     self.clients.remove(token);
+    decr!("client.connections");
 
     self.can_accept = true;
   }
@@ -236,6 +237,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         self.backend.remove(backend_token);
         if let (Some(app_id), Some(addr)) = self.clients[token].remove_backend() {
           self.configuration.close_backend(app_id, &addr);
+          decr!("backend.connections");
         }
       }
     }
@@ -263,7 +265,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
             self.from_front(client_token),
             Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
             PollOpt::edge()
-            );
+          );
           let front = self.from_front(client_token);
           &self.clients[client_token].set_front_token(front);
 
@@ -273,7 +275,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
           &self.clients[client_token].set_front_timeout(timeout);
           }
           */
-          gauge!("accept", 1);
+          incr!("client.connections");
           if should_connect {
             self.connect_to_backend(poll, client_token);
           }
@@ -313,6 +315,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         }
       },
       Ok(BackendConnectAction::New) => {
+        incr!("backend.connections");
         if let Ok(backend_token) = self.backend.insert(token) {
           let back = self.from_back(backend_token);
           self.clients[token].set_back_token(back);
@@ -562,8 +565,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
   }
 
-  fn notify(&mut self, poll: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
-    self.configuration.notify(poll, channel, message);
+  fn notify(&mut self, poll: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+    self.configuration.notify(poll, message)
   }
 
   fn timeout(&mut self, poll: &mut Poll, token: Token) {

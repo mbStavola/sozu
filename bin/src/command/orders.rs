@@ -25,12 +25,13 @@ use sozu_command::state::ConfigState;
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
-use super::state::InflightOrders;
+use super::state::OrderState;
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
+    //info!("handle_client_message: front token = {:?}, message = {:#?}", token, message);
     let config_command = message.data.clone();
     match config_command {
       ConfigCommand::SaveState(path) => {
@@ -40,8 +41,8 @@ impl CommandServer {
         self.dump_state(token, &message.id);
       },
       ConfigCommand::LoadState(path) => {
-        self.load_state(&message.id, &path);
-        self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
+        self.load_state(Some(token), &message.id, &path);
+        //self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
       },
       ConfigCommand::ListWorkers => {
         self.list_workers(token, &message.id);
@@ -60,9 +61,10 @@ impl CommandServer {
   }
 
   pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
-    where T: Into<String>,
-          U: Into<String> {
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    where T: Clone+Into<String>,
+          U: Clone+Into<String> {
+    trace!("answer_success for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
+    self.clients[token].push_message(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Ok,
       message.into(),
@@ -71,9 +73,10 @@ impl CommandServer {
   }
 
   pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
-    where T: Into<String>,
-          U: Into<String> {
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    where T: Clone+Into<String>,
+          U: Clone+Into<String> {
+    trace!("answer_error for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
+    self.clients[token].push_message(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Error,
       message.into(),
@@ -94,10 +97,11 @@ impl CommandServer {
           );
         f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
         f.write_all(&b"\n\0"[..]);
+        f.sync_all();
         counter += 1;
       }
       f.sync_all();
-      self.answer_success(token, message_id, format!("saved to {}", path), None);
+      self.answer_success(token, message_id, format!("saved {} config messages to {}", counter, path), None);
     } else {
       error!("could not open file: {}", &path);
       self.answer_error(token, message_id, "could not open file", None);
@@ -112,12 +116,17 @@ impl CommandServer {
     self.answer_success(token, message_id, serde_json::to_string(&conf).unwrap_or(String::new()), None);
   }
 
-  pub fn load_state(&mut self, message_id: &str, path: &str) {
+  pub fn load_state(&mut self, token_opt: Option<FrontToken>, message_id: &str, path: &str) {
     match fs::File::open(&path) {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
       Ok(mut file) => {
         //let mut data = vec!();
-        let mut buffer = Buffer::with_capacity(16384);
+        let mut buffer = Buffer::with_capacity(200000);
+        self.order_state.insert_task(message_id, token_opt);
+
+        info!("starting to load state from {}", path);
+
+        let mut counter = 0;
         loop {
           let previous = buffer.available_data();
           //FIXME: we should read in streaming here
@@ -137,14 +146,14 @@ impl CommandServer {
           match parse(buffer.data()) {
             IResult::Done(i, orders) => {
               if i.len() > 0 {
-                info!("could not parse {} bytes", i.len());
+                //info!("could not parse {} bytes", i.len());
                 if previous == buffer.available_data() {
                   break;
                 }
               }
               offset = buffer.data().offset(i);
 
-              let mut new_state = ConfigState::new();
+              let mut new_state = self.state.clone();
               for message in orders {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
                   new_state.handle_order(&order);
@@ -152,29 +161,27 @@ impl CommandServer {
               }
 
               let diff = self.state.diff(&new_state);
-              let mut counter = 0;
               for order in diff {
                 self.state.handle_order(&order);
 
-                if let &Order::AddHttpsFront(ref data) = &order {
+                /* if let &Order::AddHttpsFront(ref data) = &order {
                   info!("load state AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-                  data.app_id, data.hostname, data.path_begin);
+                    data.app_id, data.hostname, data.path_begin);
                 } else {
                   info!("load state {:?}", order);
-                }
+                } */
 
                 let mut found = false;
-                let id = format!("LOAD-STATE-{}", counter);
+                let id = format!("LOAD-STATE-{}-{}", message_id, counter);
 
                 for ref mut proxy in self.proxies.values_mut() {
                   let o = order.clone();
-                  //proxy.state.handle_order(&o);
-                  proxy.channel.write_message(&OrderMessage { id: id.clone(), order: o });
-                  proxy.channel.run();
+                  proxy.push_message(OrderMessage { id: id.clone(), order: o });
+                  self.order_state.insert_worker_message(message_id, &id, proxy.token.expect("worker should have a token"));
                   found = true;
 
-                  counter += 1;
                 }
+                counter += 1;
 
                 if !found {
                   // FIXME: should send back error here
@@ -195,6 +202,23 @@ impl CommandServer {
           }
           buffer.consume(offset);
         }
+        if counter > 0 {
+        info!("state loaded from {}, will start sending {} ùessages to workers", path, counter);
+        } else {
+          info!("no messages sent to workers: local state already had those messages");
+          if let Some(task) = self.order_state.task(message_id) {
+            if let Some(token) = token_opt {
+              let answer = ConfigMessageAnswer::new(
+                message_id.to_string(),
+                ConfigMessageStatus::Ok,
+                format!("ok: 0 messages, error: 0"),
+                None
+              );
+              self.clients[token].push_message(answer);
+            }
+
+          }
+        }
       }
     }
   }
@@ -213,7 +237,7 @@ impl CommandServer {
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id + 1;
     if let Ok(mut worker) = start_worker(id, &self.config) {
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
+      self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
           "sending configuration orders".to_string(),
@@ -232,19 +256,16 @@ impl CommandServer {
       }).next() {
         worker.channel.set_blocking(true);
 
+        self.order_state.insert_task(message.id.as_str(), Some(token));
         let mut counter = 0u32;
         for order in self.state.generate_orders() {
-          let message_id = format!("LAUNCH-CONF-{}", counter);
-          worker.inflight.insert(message_id.clone(), order.clone());
-          self.order_state.insert(message.id.as_str(), Token(worker_token));
+          let worker_message_id = format!("LAUNCH-CONF-{}", counter);
+          self.order_state.insert_worker_message(message.id.as_str(), worker_message_id.as_str(), Token(worker_token));
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-          self.conns[token].add_message_id(message_id.clone());
-          //worker.state.handle_order(&o);
-          if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
-            error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
-          }
+          self.clients[token].add_message_id(worker_message_id.clone());
+          worker.push_message(OrderMessage { id: worker_message_id.clone(), order: o });
 
           let received = worker.channel.read_message();
           info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
@@ -268,8 +289,9 @@ impl CommandServer {
 
   pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
     self.disable_cloexec_before_upgrade();
-    self.conns[token].channel.set_blocking(true);
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    //FIXME: do we need to be blocking here?
+    self.clients[token].channel.set_blocking(true);
+    self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
         String::from(message_id),
         ConfigMessageStatus::Processing,
         "".to_string(),
@@ -299,6 +321,7 @@ impl CommandServer {
     }
 
     self.state.handle_order(&order);
+    self.order_state.insert_task(message_id, Some(token));
 
     let mut found = false;
     for ref mut proxy in self.proxies.values_mut() {
@@ -313,15 +336,12 @@ impl CommandServer {
       }
 
 
-      self.order_state.insert(message_id, proxy.token.expect("worker should have a valid token"));
-      trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+      self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
+      trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
-      proxy.inflight.insert(String::from(message_id), order.clone());
       let o = order.clone();
-      self.conns[token].add_message_id(String::from(message_id));
-      //proxy.state.handle_order(&o);
-      proxy.channel.write_message(&OrderMessage { id: String::from(message_id), order: o });
-      proxy.channel.run();
+      self.clients[token].add_message_id(String::from(message_id));
+      proxy.push_message(OrderMessage { id: String::from(message_id), order: o });
       found = true;
     }
 
@@ -346,9 +366,7 @@ impl CommandServer {
         let mut found = false;
         for ref mut proxy in self.proxies.values_mut() {
           let o = order.clone();
-          //proxy.state.handle_order(&o);
-          proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
-          proxy.channel.run();
+          proxy.push_message(OrderMessage { id: message.id.clone(), order: o });
           found = true;
         }
 
@@ -403,7 +421,7 @@ impl CommandServer {
       state:       state,
       next_id:     self.next_id,
       token_count: self.token_count,
-      order_state: self.order_state.state.clone(),
+      //order_state: self.order_state.state.clone(),
     }
   }
 
@@ -416,7 +434,7 @@ impl CommandServer {
       state,
       next_id,
       token_count,
-      order_state,
+      //order_state,
     } = upgrade_data;
 
     println!("listener is: {}", command);
@@ -441,8 +459,7 @@ impl CommandServer {
               token:      Some(Token(token)),
               pid:        serialized.pid,
               run_state:  serialized.run_state.clone(),
-              //FIXME: transmit those as well?
-              inflight:   HashMap::new()
+              queue:      serialized.queue.clone().into(),
             }
           )
         )
@@ -462,14 +479,14 @@ impl CommandServer {
       buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
       //FIXME: deserialize client connections as well, otherwise they might leak?
-      conns:           Slab::with_capacity(128),
+      clients:         Slab::with_capacity(128),
       proxies:         workers,
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
-      order_state:     InflightOrders {
-        state: order_state
-      },
+
+      //FIXME: deserialize this as well
+      order_state:     OrderState::new(),
       must_stop:       false,
     }
   }

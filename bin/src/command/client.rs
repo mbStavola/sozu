@@ -2,6 +2,7 @@ use mio::*;
 use mio::timer::Timeout;
 use mio_uds::UnixStream;
 use std::str::from_utf8;
+use std::collections::VecDeque;
 use nom::IResult;
 use serde_json::from_str;
 
@@ -21,6 +22,7 @@ pub struct CommandClient {
   pub token:         Option<Token>,
   message_ids:       Vec<String>,
   pub write_timeout: Option<Timeout>,
+  pub queue:         VecDeque<ConfigMessageAnswer>,
 }
 
 impl CommandClient {
@@ -31,6 +33,7 @@ impl CommandClient {
       token:           None,
       message_ids:     Vec::new(),
       write_timeout:   None,
+      queue:           VecDeque::new(),
     }
   }
 
@@ -51,6 +54,14 @@ impl CommandClient {
     self.channel.write_message(message)
   }
 
+  pub fn push_message(&mut self, message: ConfigMessageAnswer) {
+    self.queue.push_back(message);
+    self.channel.interest.insert(Ready::writable());
+  }
+
+  pub fn can_handle_events(&self) -> bool {
+    self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
+  }
 }
 
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {

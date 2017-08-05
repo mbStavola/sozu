@@ -7,12 +7,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
-use std::collections::{HashMap,HashSet};
+use std::collections::{HashMap,HashSet,VecDeque};
 use std::time::Duration;
 use libc::{pid_t,kill};
 
 use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
 use sozu::channel::Channel;
+use sozu::network::metrics::METRICS;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
@@ -47,7 +48,7 @@ pub struct Worker {
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
-  pub inflight:      HashMap<String,Order>,
+  pub queue:         VecDeque<OrderMessage>,
 }
 
 impl Worker {
@@ -58,8 +59,17 @@ impl Worker {
       token:      None,
       pid:        pid,
       run_state:  RunState::Running,
-      inflight:   HashMap::new(),
+      queue:      VecDeque::new(),
     }
+  }
+
+  pub fn push_message(&mut self, message: OrderMessage) {
+    self.queue.push_back(message);
+    self.channel.interest.insert(Ready::writable());
+  }
+
+  pub fn can_handle_events(&self) -> bool {
+    self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
   }
 }
 
@@ -79,7 +89,7 @@ pub struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
   max_buffer_size: usize,
-  conns:           Slab<CommandClient,FrontToken>,
+  clients:         Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, Worker>,
   next_id:         u32,
   state:           ConfigState,
@@ -87,7 +97,7 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
-  order_state:     state::InflightOrders,
+  order_state:     state::OrderState,
   must_stop:       bool,
 }
 
@@ -98,16 +108,16 @@ impl CommandServer {
     let acc = self.sock.accept();
     if let Ok(Some((sock, _))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
-      let tok = self.conns.insert(conn)
+      let tok = self.clients.insert(conn)
         .ok().expect("could not add connection to slab");
 
       // Register the connection
       let token = self.from_front(tok);
-      self.conns[tok].token = Some(token);
+      self.clients[tok].token = Some(token);
       let mut interest = Ready::hup();
       interest.insert(Ready::readable());
       interest.insert(Ready::writable());
-      self.poll.register(&self.conns[tok].channel.sock, token, interest, PollOpt::edge())
+      self.poll.register(&self.clients[tok].channel.sock, token, Ready::all(), PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
       let accept_interest = Ready::readable();
@@ -128,12 +138,20 @@ impl CommandServer {
   fn new(srv: UnixListener, config: Config, mut proxy_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+    METRICS.with(|metrics| {
+      if let Some(sock) = (*metrics.borrow()).socket() {
+        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+      } else {
+        error!("could not register metrics socket");
+      }
+    });
+
 
     let next_id = proxy_vec.len();
 
     let mut proxies = HashMap::new();
 
-    let mut token_count = 0;
+    let mut token_count = 1;
     //FIXME: verify there's at least one worker
     //TODO: make config state from Config ADD IP ADDRESSES AND PORTS
     let state: ConfigState = Default::default();
@@ -158,7 +176,7 @@ impl CommandServer {
       sock:            srv,
       buffer_size:     buffer_size,
       max_buffer_size: config.max_command_buffer_size.unwrap_or(buffer_size * 2),
-      conns:           Slab::with_capacity(128),
+      clients:         Slab::with_capacity(128),
       proxies:         proxies,
       next_id:         next_id as u32,
       state:           state,
@@ -166,17 +184,17 @@ impl CommandServer {
       timer:           timer,
       config:          config,
       token_count:     token_count,
-      order_state:     state::InflightOrders::new(),
+      order_state:     state::OrderState::new(),
       must_stop:       false,
     }
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - HALF_USIZE - 1)
+    FrontToken(token.0 - HALF_USIZE - 2)
   }
 
   pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + HALF_USIZE + 1)
+    Token(token.0 + HALF_USIZE + 2)
   }
 
 }
@@ -191,11 +209,62 @@ impl CommandServer {
         self.ready(event.token(), event.kind());
       }
 
+      loop {
+        let mut did_something = false;
+        {
+          let tokens: Vec<Token> = self.clients.iter().filter(|client| client.can_handle_events()).map(|client| client.token.unwrap()).collect();
+
+          if ! tokens.is_empty() {
+            did_something = true;
+          }
+          //let messages: Vec<usize> = self.clients.iter().map(|client| client.queue.len()).collect();
+
+          //for ref client in self.clients.iter() {
+          //  let ids: Vec<&str> = client.queue.iter().map(|msg| msg.id.as_str()).collect();
+            //info!("client readiness = {:#?}, interest = {:#?}, queue = {}", client.channel.readiness,
+            //  client.channel.interest, ids.len());
+          //}
+          //info!("will handle clients: {:#?} (message queues: {:?})", tokens, messages);
+          for token in tokens {
+            let front = self.to_front(token);
+            self.handle_client_events(front);
+          }
+        }
+
+        {
+          let tokens: Vec<Token> = self.proxies.iter().filter(|&(_, worker)| worker.can_handle_events()).map(|(token, _)| token.clone()).collect();
+
+          if ! tokens.is_empty() {
+            did_something = true;
+          }
+
+          //for (ref token, ref worker) in self.proxies.iter() {
+          //  let ids: Vec<&str> = worker.queue.iter().map(|msg| msg.id.as_str()).collect();
+            //info!("worker {}, readiness = {:#?}, interest = {:#?}, queue = {}", token.0, worker.channel.readiness,
+            //  worker.channel.interest, ids.len());
+          //}
+
+          //info!("will handle workers: {:?}", tokens);
+          for token in tokens {
+            self.handle_worker_events(token);
+          }
+        }
+
+        if ! did_something {
+          break;
+        }
+      }
+
+      METRICS.with(|metrics| {
+        (*metrics.borrow_mut()).send_data();
+      });
+
       if self.must_stop {
         info!("stopping...");
         break;
       }
     }
+
   }
 
   fn ready(&mut self, token: Token, events: Ready) {
@@ -208,70 +277,141 @@ impl CommandServer {
           error!("received writable for token 0");
         }
       },
+      Token(1) => {
+        METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).writable();
+        });
+      },
       Token(i) if i < HALF_USIZE + 1 => {
-        let mut messages = {
-          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
+        if let Some(ref mut proxy) =self.proxies.get_mut(&Token(i)) {
           proxy.channel.handle_events(events);
-          proxy.channel.run();
-
-          let mut messages = Vec::new();
-          loop {
-            let msg = proxy.channel.read_message();
-            if msg.is_none() {
-              break;
-            } else {
-              messages.push(msg.unwrap());
-            }
-          }
-
-          messages
-        };
-
-        for msg in messages.drain(..) {
-          self.proxy_handle_message(Token(i), msg);
         }
 
-        {
-          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
-          proxy.channel.run();
-        }
+        self.handle_worker_events(Token(i));
 
       },
       _ => {
         let conn_token = self.to_front(token);
-        if self.conns.contains(conn_token) {
-          self.conns[conn_token].channel.handle_events(events);
-          self.conns[conn_token].channel.run();
+        if self.clients.contains(conn_token) {
+          self.clients[conn_token].channel.handle_events(events);
+        }
 
-          //FIXME: handle deconnection
+        self.handle_client_events(conn_token);
+      }
+    }
+    //trace!("ready end: {:?} -> {:?}", token, events);
+  }
+
+  pub fn handle_worker_events(&mut self, token: Token) {
+    let mut messages = {
+      let mut messages = Vec::new();
+      let ref mut proxy = self.proxies.get_mut(&token).unwrap();
+      loop {
+        if !proxy.queue.is_empty() {
+          proxy.channel.interest.insert(Ready::writable());
+        }
+
+        //trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
+        //  proxy.channel.interest, proxy.queue.len());
+
+        if proxy.channel.readiness() == Ready::empty() {
+          break;
+        }
+
+        if proxy.channel.readiness().is_readable() {
+          proxy.channel.readable();
+
           loop {
-            let message = self.conns[conn_token].channel.read_message();
-
-            // if the message was too large, we grow the buffer and retry to read if possible
-            if message.is_none() {
-              if self.conns[conn_token].channel.readiness.is_hup() {
-                break;
-              }
-
-              if (self.conns[conn_token].channel.interest & self.conns[conn_token].channel.readiness).is_readable() {
-                self.conns[conn_token].channel.run();
+            if let Some(msg) = proxy.channel.read_message() {
+              messages.push(msg);
+            } else {
+              if (proxy.channel.interest & proxy.channel.readiness).is_readable() {
+                proxy.channel.readable();
                 continue;
               } else {
                 break;
               }
             }
+          }
+        }
 
-            let message = message.unwrap();
-            self.handle_client_message(conn_token, &message);
+        if !proxy.queue.is_empty() {
+          proxy.channel.interest.insert(Ready::writable());
+        }
 
+        if proxy.channel.readiness.is_writable() {
+          loop {
+            if let Some(msg) = proxy.queue.pop_front() {
+              if !proxy.channel.write_message(&msg) {
+                proxy.queue.push_front(msg);
+              }
+            }
+
+            if proxy.channel.back_buf.available_data() > 0 {
+              proxy.channel.writable();
+            }
+
+            if !proxy.channel.readiness.is_writable() {
+              break;
+            }
+
+            if proxy.channel.back_buf.available_data() == 0 && proxy.queue.len() == 0 {
+              break;
+            }
+          }
+        }
+      }
+
+      messages
+    };
+
+    for msg in messages.drain(..) {
+      self.proxy_handle_message(token, msg);
+    }
+  }
+
+  pub fn handle_client_events(&mut self, conn_token: FrontToken) {
+    if self.clients.contains(conn_token) {
+
+      if self.clients[conn_token].channel.readiness.is_hup() {
+        self.poll.deregister(&self.clients[conn_token].channel.sock);
+        self.clients.remove(conn_token);
+        trace!("closed client [{}]", conn_token.0);
+      } else {
+        loop {
+          /*trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?}), queue={} elements", conn_token.0,
+            self.clients[conn_token].channel.readiness(),
+            self.clients[conn_token].channel.readiness,
+            self.clients[conn_token].channel.interest,
+            self.clients[conn_token].queue.len()
+          );*/
+
+          if self.clients[conn_token].channel.readiness() == Ready::empty() {
+            break;
           }
 
-          self.conns[conn_token].channel.run();
+          if self.clients[conn_token].channel.readiness().is_writable() {
+            if let Some(msg) = self.clients[conn_token].queue.pop_front() {
+              if! self.clients[conn_token].channel.write_message(&msg) {
+                self.clients[conn_token].queue.push_front(msg);
+              }
+              self.clients[conn_token].channel.writable();
+            }
 
-          if self.conns[conn_token].channel.readiness.is_hup() {
-            self.poll.deregister(&self.conns[conn_token].channel.sock);
-            self.conns.remove(conn_token);
-            trace!("closed client [{}]", token.0);
+            if !self.clients[conn_token].queue.is_empty() {
+               self.clients[conn_token].channel.interest.insert(Ready::writable());
+            }
+          }
+
+          if self.clients[conn_token].channel.readiness().is_readable() {
+            self.clients[conn_token].channel.readable();
+            loop {
+              if let Some(message) = self.clients[conn_token].channel.read_message() {
+                self.handle_client_message(conn_token, &message);
+              } else {
+                break;
+              }
+            }
           }
         }
       }
@@ -279,55 +419,88 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    //info!("token {:?} got answer msg: {:?}", token, msg);
-    //info!("inflight: {:?}", self.inflight);
+    trace!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
       let mut stopping = false;
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
-        if let Some(order) = proxy.inflight.remove(&msg.id) {
-          info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
-          // handle message completion here
-          // there will probably be other cases to handle in the future
-          if order == Order::SoftStop || order == Order::HardStop {
-            stopping = true;
-            proxy.run_state = RunState::Stopped
+        //FIXME:  handle STOP order here
+        //if order == Order::SoftStop || order == Order::HardStop {
+        //  stopping = true;
+        //  proxy.run_state = RunState::Stopped
+        //}
+      }
+
+      match msg.status {
+        OrderMessageStatus::Processing => {
+          //FIXME: right now, do nothing with the curent tasks
+        },
+        OrderMessageStatus::Error(s) => {
+          if let Some(client_message_id) = self.order_state.error(&msg.id, token) {
+            //FIXME: send message to client here
+
+            if let Some(task) = self.order_state.task(&client_message_id) {
+              //info!("TERMINATING task: {:#?}", task);
+              let data = match msg.data {
+                None => None,
+                Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
+              };
+
+              let answer = ConfigMessageAnswer::new(
+                client_message_id,
+                ConfigMessageStatus::Error,
+                format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
+                data,
+              );
+
+              if let Some(client_token) = task.client {
+                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+                self.clients[client_token].push_message(answer);
+              }
+            }
+          }
+        },
+        OrderMessageStatus::Ok => {
+          if let Some(client_message_id) = self.order_state.ok(&msg.id, token) {
+            //FIXME: send message to client here
+            if let Some(task) = self.order_state.task(&client_message_id) {
+              //info!("TERMINATING task: {:#?}", task);
+
+              let answer = if task.error.is_empty() {
+                let data = match msg.data {
+                  None => None,
+                  Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
+                };
+
+                ConfigMessageAnswer::new(
+                  client_message_id,
+                  ConfigMessageStatus::Ok,
+                  format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
+                  data,
+                )
+              } else {
+                ConfigMessageAnswer::new(
+                  msg.id.clone(),
+                  ConfigMessageStatus::Error,
+                  format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
+                  None,
+                )
+              };
+
+              if let Some(client_token) = task.client {
+                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+                self.clients[client_token].push_message(answer);
+              }
+            }
+
+            //FIXME: the task should hold the message type,
+            //so we can know it's a stop message
+            if stopping {
+              self.must_stop = true;
+
+            }
           }
         }
       }
-
-      if self.order_state.remove(&msg.id, token) && stopping {
-        self.must_stop = true;
-      }
-    }
-
-    let data = match msg.data {
-      None => None,
-      Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
-    };
-
-    let answer = ConfigMessageAnswer::new(
-      msg.id.clone(),
-      match msg.status {
-        OrderMessageStatus::Error(_)   => ConfigMessageStatus::Error,
-        OrderMessageStatus::Ok         => ConfigMessageStatus::Ok,
-        OrderMessageStatus::Processing => ConfigMessageStatus::Processing,
-      },
-      match msg.status {
-        OrderMessageStatus::Error(s) => s.clone(),
-        _                             => String::new(),
-      },
-      data,
-    );
-
-    info!("sending: {:?}", answer);
-    for client in self.conns.iter_mut() {
-      if let Some(index) = client.has_message_id(&msg.id) {
-        client.write_message(&answer);
-        if answer.status != ConfigMessageStatus::Processing {
-          client.remove_message_id(index);
-        }
-      }
-      client.channel.run();
     }
   }
 }
@@ -359,7 +532,7 @@ pub fn start(config: Config, proxies: Vec<Worker>) {
       server.load_static_application_configuration();
 
       saved_state.as_ref().map(|state_path| {
-        server.load_state("INITIALIZATION", state_path);
+        server.load_state(None, "INITIALIZATION", state_path);
       });
 
       info!("listen for connections");

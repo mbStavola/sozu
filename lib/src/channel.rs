@@ -24,7 +24,7 @@ pub enum ConnError {
 pub struct Channel<Tx,Rx> {
   pub sock:        UnixStream,
   front_buf:       Buffer,
-  back_buf:        Buffer,
+  pub back_buf:    Buffer,
   max_buffer_size: usize,
   pub readiness:   Ready,
   pub interest:    Ready,
@@ -82,6 +82,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
   pub fn handle_events(&mut self, events: Ready) {
     self.readiness = self.readiness | events;
+  }
+
+  pub fn readiness(&self) -> Ready {
+    self.readiness & self.interest
   }
 
   pub fn run(&mut self) {
@@ -162,10 +166,11 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
         Err(e) => {
           match e.kind() {
             ErrorKind::WouldBlock => {
-              self.interest.remove(Ready::writable());
+              self.readiness.remove(Ready::writable());
               break;
             },
-            _ => {
+            e => {
+              error!("channel write error: {:?}", e);
               self.interest  = Ready::empty();
               self.readiness = Ready::empty();
               return Err(ConnError::SocketError);
