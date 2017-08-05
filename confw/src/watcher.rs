@@ -20,7 +20,7 @@ pub fn watch(config_file: &str, update_interval: Duration) -> Result<()> {
         match rx.recv() {
             Ok(event) => {
                 match event {
-                    DebouncedEvent::Write(path) => {
+                    DebouncedEvent::Write(path) | DebouncedEvent::Create(path) | DebouncedEvent::Chmod(path) => {
                         println!("File written, generating diff.");
                         let new_state: ConfigState = parse_config_file(&path);
                         println!("{:?}", new_state);
@@ -38,8 +38,9 @@ pub fn watch(config_file: &str, update_interval: Duration) -> Result<()> {
                         watcher.unwatch(old_path)?;
                         watcher.watch(new_path, RecursiveMode::NonRecursive)?;
                     }
-                    _ => {
+                    event => {
                         // Error
+                        println!("{:?}", event);
                     }
                 }
             }
@@ -62,7 +63,7 @@ fn parse_config_file(path: &PathBuf) -> ConfigState {
 }
 
 fn parse_config(data: &str) -> ConfigState {
-    let tables: Vec<RoutingConfig> = toml::from_str(data).expect("could not parse config");
+    let tables: HashMap<String, RoutingConfig> = toml::from_str(data).expect("could not parse config");
 
     let mut instances: HashMap<AppId, Vec<Instance>> = HashMap::new();
     let mut http_fronts: HashMap<AppId, Vec<HttpFront>> = HashMap::new();
@@ -71,8 +72,7 @@ fn parse_config(data: &str) -> ConfigState {
     let mut http_addresses: Vec<(String, u16)> = Vec::new();
     let mut https_addresses: Vec<(String, u16)> = Vec::new();
 
-    for table in tables {
-        let app_id = &table.app_id.to_owned();
+    for (app_id, table) in tables {
         let hostname = &table.hostname.to_owned();
         let path_begin = &table.path_begin.unwrap_or("/").to_owned();
         table.certificate;
@@ -146,7 +146,6 @@ backends  = [ "127.0.0.1:1026" ] # list of IP/port
 */
 #[derive(Debug, Default, Clone, Deserialize)]
 struct RoutingConfig<'a> {
-    app_id: &'a str,
     hostname: &'a str,
     path_begin: Option<&'a str>,
     certificate: Option<&'a str>,

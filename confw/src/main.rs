@@ -47,5 +47,6 @@ fn main() {
         Duration::from_secs(parsed_value)
     }).expect("required interval");
 
+    println!("Watching file `{}`. Updating every {} second(s).", config_file, update_interval.as_secs());
     watcher::watch(config_file, update_interval);
 }
