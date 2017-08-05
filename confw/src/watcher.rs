@@ -23,6 +23,7 @@ pub fn watch(config_file: &str, update_interval: Duration) -> Result<()> {
                     DebouncedEvent::Write(path) => {
                         println!("File written, generating diff.");
                         let new_state: ConfigState = parse_config_file(&path);
+                        println!("{:?}", new_state);
                         let old_state: ConfigState = unimplemented!();
 
                         println!("Sending new configuration to server.");
