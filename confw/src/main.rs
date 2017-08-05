@@ -1,7 +1,12 @@
 #[macro_use]
 extern crate clap;
+
+#[macro_use]
+extern crate serde_derive;
+
 extern crate notify;
 extern crate toml;
+extern crate serde;
 
 #[macro_use]
 extern crate sozu_lib as sozu;

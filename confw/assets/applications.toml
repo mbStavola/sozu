@@ -1,8 +1,7 @@
-[applications]
-
-[applications.MyApp]
+[RoutingConfig]
+app_id = "MyApp"
 hostname   = "lolcatho.st"
-#path_begin = "/api" # optional
+path_begin = "/api" # optional
 certificate = "../lib/assets/certificate.pem" # optional
 key = "../lib/assets/key.pem" # optional
 certificate_chain = "../lib/assets/certificate_chain.pem" # optional

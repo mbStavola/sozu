@@ -272,6 +272,64 @@ impl ConfigState {
   }
 }
 
+pub struct ConfigStateBuilder {
+  instances:       HashMap<AppId, Vec<Instance>>,
+  http_fronts:     Option<HashMap<AppId, Vec<HttpFront>>>,
+  https_fronts:    Option<HashMap<AppId, Vec<HttpsFront>>>,
+  certificates:    Option<HashMap<CertFingerprint, CertificateAndKey>>,
+  http_addresses:  Option<Vec<(String, u16)>>,
+  https_addresses: Option<Vec<(String, u16)>>,
+}
+
+impl ConfigStateBuilder {
+  pub fn new(instances: HashMap<AppId, Vec<Instance>>) -> ConfigStateBuilder {
+    ConfigStateBuilder {
+      instances: instances,
+      http_fronts: None,
+      https_fronts: None,
+      certificates: None,
+      http_addresses: None,
+      https_addresses: None
+    }
+  }
+
+  pub fn http_fronts(mut self, http_fronts: HashMap<AppId, Vec<HttpFront>>) -> ConfigStateBuilder {
+    self.http_fronts = Some(http_fronts);
+    self
+  }
+
+  pub fn https_fronts(mut self, https_fronts: HashMap<AppId, Vec<HttpsFront>>) -> ConfigStateBuilder {
+    self.https_fronts = Some(https_fronts);
+    self
+  }
+
+  pub fn certificates(mut self, certificates: HashMap<CertFingerprint, CertificateAndKey>) -> ConfigStateBuilder {
+    self.certificates = Some(certificates);
+    self
+  }
+
+  pub fn http_addresses(mut self, http_addresses: Vec<(String, u16)>) -> ConfigStateBuilder {
+    self.http_addresses = Some(http_addresses);
+    self
+  }
+
+  pub fn https_addresses(mut self, https_addresses: Vec<(String, u16)>) -> ConfigStateBuilder {
+    self.https_addresses = Some(https_addresses);
+    self
+  }
+
+  pub fn build(self) -> ConfigState {
+    ConfigState {
+      instances: self.instances,
+      http_fronts: self.http_fronts.unwrap_or(HashMap::new()),
+      https_fronts: self.https_fronts.unwrap_or(HashMap::new()),
+      certificates: self.certificates.unwrap_or(HashMap::new()),
+      http_addresses: self.http_addresses.unwrap_or(Vec::new()),
+      https_addresses: self.https_addresses.unwrap_or(Vec::new())
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
