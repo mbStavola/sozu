@@ -8,9 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use std::path::PathBuf;
-use std::fs::File;
-use std::io::Read;
-use serde::Deserialize;
 
 pub fn watch(config_file: &str, update_interval: Duration) -> Result<()> {
     let (tx, rx) = channel();
