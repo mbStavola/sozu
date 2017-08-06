@@ -1,5 +1,5 @@
-[test]
-hostname   = "lolcatho.st"
+[[test]]
+hostname = "lolcatho.st"
 path_begin = "/api" # optional
 certificate = "../lib/assets/certificate.pem" # optional
 key = "../lib/assets/key.pem" # optional
@@ -7,7 +7,13 @@ certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 frontends = ["HTTP", "HTTPS"] # list of proxy tags
 backends  = [ "127.0.0.1:1022" ] # list of IP/port
 
-[mytest2]
-hostname   = "misa.ka"
-frontends = ["HTTP"] # list of proxy tags
-backends  = [ "127.0.0.1:1021" ] # list of IP/port
+[[test]]
+hostname  = "misa.ka"
+frontends = ["HTTP"]
+backends  = [ "127.0.0.1:1021" ]
+
+[[other]]
+hostname = "asu.ka"
+path_begin = "/other"
+frontends = ["HTTP"]
+backends = ["127.0.0.1:1024"]

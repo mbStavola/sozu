@@ -63,7 +63,7 @@ fn parse_config_file(path: &PathBuf) -> ConfigState {
 }
 
 fn parse_config(data: &str) -> ConfigState {
-    let tables: HashMap<String, RoutingConfig> = toml::from_str(data).expect("could not parse config");
+    let table_map: HashMap<String, Vec<RoutingConfig>> = toml::from_str(data).expect("could not parse config");
 
     let mut instances: HashMap<AppId, Vec<Instance>> = HashMap::new();
     let mut http_fronts: HashMap<AppId, Vec<HttpFront>> = HashMap::new();
@@ -72,57 +72,59 @@ fn parse_config(data: &str) -> ConfigState {
     let mut http_addresses: Vec<(String, u16)> = Vec::new();
     let mut https_addresses: Vec<(String, u16)> = Vec::new();
 
-    for (app_id, table) in tables {
-        let hostname = &table.hostname.to_owned();
-        let path_begin = &table.path_begin.unwrap_or("/").to_owned();
-        table.certificate;
+    for (app_id, table_list) in table_map {
+        for table in table_list {
+            let hostname = &table.hostname.to_owned();
+            let path_begin = &table.path_begin.unwrap_or("/").to_owned();
+            table.certificate;
 
-        let mut authorities: Vec<(String, u16)> = table.backends.iter().map(|authority| {
-            let mut split = authority.split(":");
+            let mut authorities: Vec<(String, u16)> = table.backends.iter().map(|authority| {
+                let mut split = authority.split(":");
 
-            let host = split.next().expect("host is required").to_owned();
-            let port = split.next().unwrap_or("80").parse::<u16>().expect("could not parse port");
+                let host = split.next().expect("host is required").to_owned();
+                let port = split.next().unwrap_or("80").parse::<u16>().expect("could not parse port");
 
-            (host, port)
-        }).collect();
-
-        if table.frontends.contains(&"HTTP") {
-            http_fronts.entry(app_id.clone())
-                .or_insert(Vec::new())
-                .push(HttpFront {
-                    app_id: app_id.clone(),
-                    hostname: hostname.clone(),
-                    path_begin: path_begin.clone()
-                });
-
-            http_addresses.append(&mut authorities)
-        }
-
-        //        if table.frontends.contains(&"HTTPS") {
-        //            https_fronts.entry(app_id.clone())
-        //                .or_insert(Vec::new())
-        //                .push(HttpsFront {
-        //                    app_id: app_id.clone(),
-        //                    hostname: hostname.clone(),
-        //                    path_begin: path_begin.clone(),
-        //                    fingerprint:
-        //                });
-        //
-        //            https_addresses.append(&mut authorities)
-        //        }
-
-        {
-            let mut backends: Vec<Instance> = authorities.iter().map(|authority| {
-                let (ref host, port): (String, u16) = *authority;
-
-                Instance {
-                    app_id: app_id.clone(),
-                    ip_address: host.clone(),
-                    port: port
-                }
+                (host, port)
             }).collect();
 
-            instances.entry(app_id.clone()).or_insert(Vec::new()).append(&mut backends);
+            if table.frontends.contains(&"HTTP") {
+                http_fronts.entry(app_id.clone())
+                    .or_insert(Vec::new())
+                    .push(HttpFront {
+                        app_id: app_id.clone(),
+                        hostname: hostname.clone(),
+                        path_begin: path_begin.clone()
+                    });
+
+                http_addresses.append(&mut authorities)
+            }
+
+            //        if table.frontends.contains(&"HTTPS") {
+            //            https_fronts.entry(app_id.clone())
+            //                .or_insert(Vec::new())
+            //                .push(HttpsFront {
+            //                    app_id: app_id.clone(),
+            //                    hostname: hostname.clone(),
+            //                    path_begin: path_begin.clone(),
+            //                    fingerprint:
+            //                });
+            //
+            //            https_addresses.append(&mut authorities)
+            //        }
+
+            {
+                let mut backends: Vec<Instance> = authorities.iter().map(|authority| {
+                    let (ref host, port): (String, u16) = *authority;
+
+                    Instance {
+                        app_id: app_id.clone(),
+                        ip_address: host.clone(),
+                        port: port
+                    }
+                }).collect();
+
+                instances.entry(app_id.clone()).or_insert(Vec::new()).append(&mut backends);
+            }
         }
     }
 
