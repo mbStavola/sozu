@@ -1,8 +1,10 @@
 use notify::{RecommendedWatcher, Watcher, RecursiveMode, DebouncedEvent, Result};
 use toml;
 use sozu::messages::{CertFingerprint, CertificateAndKey, Order, HttpFront, HttpsFront, Instance};
+use sozu_command::certificate::{split_certificate_chain, calculate_fingerprint};
 use sozu_command::state::{AppId, ConfigState, ConfigStateBuilder};
-use std::collections::HashMap;
+use sozu_command::config::Config;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use std::path::PathBuf;
@@ -53,11 +55,8 @@ pub fn watch(config_file: &str, update_interval: Duration) -> Result<()> {
 }
 
 fn parse_config_file(path: &PathBuf) -> ConfigState {
-    let mut data = String::new();
-    {
-        let mut f = File::open(path).expect("could not open file");
-        f.read_to_string(&mut data).expect("could not read file");
-    }
+    let path = path.to_str().expect("could not convert PathBuf to string");
+    let data = Config::load_file(path).expect("could not load config file");
 
     parse_config(&data)
 }
@@ -99,18 +98,46 @@ fn parse_config(data: &str) -> ConfigState {
                 http_addresses.append(&mut authorities)
             }
 
-            //        if table.frontends.contains(&"HTTPS") {
-            //            https_fronts.entry(app_id.clone())
-            //                .or_insert(Vec::new())
-            //                .push(HttpsFront {
-            //                    app_id: app_id.clone(),
-            //                    hostname: hostname.clone(),
-            //                    path_begin: path_begin.clone(),
-            //                    fingerprint:
-            //                });
-            //
-            //            https_addresses.append(&mut authorities)
-            //        }
+            if table.frontends.contains(&"HTTPS") {
+                let certificate = table.certificate.map(|path| {
+                    let certificate = Config::load_file(path).expect("could not load chain file");
+                    certificate
+                }).expect("HTTPS requires a certificate");
+
+                let key = table.key.map(|path| {
+                    let key: String = Config::load_file(path).expect("could not load chain file");
+                    key
+                }).expect("HTTPS requires a key");
+
+                let certificate_chain = table.certificate_chain.map(|path| {
+                    let chain = Config::load_file(path).expect("could not load chain file");
+
+                    split_certificate_chain(chain)
+                }).unwrap_or(Vec::new());
+
+                let certificate_and_key = CertificateAndKey {
+                    certificate: certificate,
+                    key: key,
+                    certificate_chain: certificate_chain
+                };
+
+                let fingerprint = calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..])
+                    .map(|it| CertFingerprint(it))
+                    .expect("could not calculate fingerprint");
+
+                certificates.insert(fingerprint.clone(), certificate_and_key);
+
+                https_fronts.entry(app_id.clone())
+                    .or_insert(Vec::new())
+                    .push(HttpsFront {
+                        app_id: app_id.clone(),
+                        hostname: hostname.clone(),
+                        path_begin: path_begin.clone(),
+                        fingerprint: fingerprint
+                    });
+
+                https_addresses.append(&mut authorities)
+            }
 
             {
                 let mut backends: Vec<Instance> = authorities.iter().map(|authority| {
@@ -153,6 +180,6 @@ struct RoutingConfig<'a> {
     certificate: Option<&'a str>,
     key: Option<&'a str>,
     certificate_chain: Option<&'a str>,
-    frontends: Vec<&'a str>,
+    frontends: HashSet<&'a str>,
     backends: Vec<&'a str>
 }
